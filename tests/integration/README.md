@@ -485,6 +485,15 @@ If not specified, `~/.kube/config` will be used by default.
 
 Note that the HUB and TAG environment variables **must** be set when running tests in the Kubernetes environment.
 
+### KinD Cluster Environment Variables
+
+The following environment variables can be used to configure the KinD cluster setup when running tests via `prow/integ-suite-kind.sh`:
+
+| Name | Description |
+|---|---|
+| `SKIP_SETUP` | Skip KinD cluster setup entirely if set. Useful when reusing an existing cluster. |
+| `NOMETALBINSTALL` | Skip MetalLB installation if set. Useful when using [cloud-provider-kind](https://github.com/kubernetes-sigs/cloud-provider-kind). |
+
 ## Diagnosing Failures
 
 ### Working Directory
