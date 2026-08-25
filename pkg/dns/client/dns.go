@@ -17,6 +17,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -24,8 +25,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsconf"
+	"codeberg.org/miekg/dns/dnsutil"
 	"github.com/google/uuid"
-	"github.com/miekg/dns"
 
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/config/constants"
@@ -150,7 +153,7 @@ func NewLocalDNSServer(proxyNamespace, proxyDomain string, addr string, opts ...
 	}
 
 	// We will use the local resolv.conf for resolving unknown names.
-	dnsConfig, err := dns.ClientConfigFromFile(resolvConf)
+	dnsConfig, err := dnsconf.FromFile(resolvConf)
 	if err != nil {
 		log.Warnf("failed to load %s: %v", resolvConf, err)
 		return nil, err
@@ -255,22 +258,28 @@ func (h *LocalDNSServer) BuildAlternateHosts(nt *dnsProto.NameTable,
 }
 
 // upstream sends the request to the upstream server, with associated logs and metrics
-func (h *LocalDNSServer) upstream(proxy *dnsProxy, req *dns.Msg, hostname string) *dns.Msg {
+func (h *LocalDNSServer) upstream(ctx context.Context, proxy *dnsProxy, req *dns.Msg, hostname string) *dns.Msg {
 	upstreamRequests.Increment()
 	start := time.Now()
 	// We did not find the host in our internal cache. Query upstream and return the response as is.
 	log.Debugf("response for hostname %q not found in dns proxy, querying upstream", hostname)
-	response := h.queryUpstream(proxy.upstreamClient, req, log)
+	response := h.queryUpstream(ctx, proxy.upstreamClient, proxy.protocol, req, log)
 	requestDuration.Record(time.Since(start).Seconds())
 	log.Debugf("upstream response for hostname %q : %v", hostname, response)
 	return response
 }
 
 // ServeDNS is the implementation of DNS interface
-func (h *LocalDNSServer) ServeDNS(proxy *dnsProxy, w dns.ResponseWriter, req *dns.Msg) {
+func (h *LocalDNSServer) ServeDNS(ctx context.Context, proxy *dnsProxy, w dns.ResponseWriter, req *dns.Msg) {
 	requests.Increment()
+	// In v2 the server only unpacks the question section before dispatching to the handler.
+	// Fully unpack the message so EDNS options (notably the advertised UDP buffer size, used
+	// below for truncation and for sizing the upstream read buffer) are populated.
+	if err := req.Unpack(); err != nil {
+		log.Debugf("failed to fully unpack DNS request: %v", err)
+	}
 	var response *dns.Msg
-	log := log.WithLabels("protocol", proxy.protocol, "edns", req.IsEdns0() != nil)
+	log := log.WithLabels("protocol", proxy.protocol, "edns", len(req.Pseudo) > 0)
 	if log.DebugEnabled() {
 		id := uuid.New()
 		log = log.WithLabels("id", id)
@@ -279,25 +288,25 @@ func (h *LocalDNSServer) ServeDNS(proxy *dnsProxy, w dns.ResponseWriter, req *dn
 
 	if len(req.Question) == 0 {
 		response = new(dns.Msg)
-		response.SetReply(req)
+		dnsutil.SetReply(response, req)
 		response.Rcode = dns.RcodeServerFailure
-		_ = w.WriteMsg(response)
+		_, _ = io.Copy(w, response)
 		return
 	}
 
 	lp := h.lookupTable.Load()
-	hostname := strings.ToLower(req.Question[0].Name)
+	hostname := strings.ToLower(req.Question[0].Header().Name)
 	if lp == nil {
 		if h.respondBeforeSync {
-			response = h.upstream(proxy, req, hostname)
-			response.Truncate(size(proxy.protocol, req))
-			_ = w.WriteMsg(response)
+			response = h.upstream(ctx, proxy, req, hostname)
+			truncate(proxy.protocol, req, response)
+			_, _ = io.Copy(w, response)
 		} else {
 			log.Debugf("dns request for host %q before lookup table is loaded", hostname)
 			response = new(dns.Msg)
-			response.SetReply(req)
+			dnsutil.SetReply(response, req)
 			response.Rcode = dns.RcodeServerFailure
-			_ = w.WriteMsg(response)
+			_, _ = io.Copy(w, response)
 		}
 		return
 	}
@@ -307,11 +316,11 @@ func (h *LocalDNSServer) ServeDNS(proxy *dnsProxy, w dns.ResponseWriter, req *dn
 	// This name will always end in a dot.
 	// We expect only one question in the query even though the spec allows many
 	// clients usually do not do more than one query either.
-	answers, hostFound := lookupTable.lookupHost(req.Question[0].Qtype, hostname)
+	answers, hostFound := lookupTable.lookupHost(dns.RRToType(req.Question[0]), hostname)
 
 	if hostFound {
 		response = new(dns.Msg)
-		response.SetReply(req)
+		dnsutil.SetReply(response, req)
 		// We are the authority here, since we control DNS for known hostnames
 		response.Authoritative = true
 		// Even if answers is empty, we still return NOERROR. This matches expected behavior of DNS
@@ -327,13 +336,13 @@ func (h *LocalDNSServer) ServeDNS(proxy *dnsProxy, w dns.ResponseWriter, req *dn
 		}
 		log.Debugf("response for hostname %q (found=true): %v", hostname, response)
 	} else {
-		response = h.upstream(proxy, req, hostname)
+		response = h.upstream(ctx, proxy, req, hostname)
 	}
 	// Compress the response - we don't know if the incoming response was compressed or not. If it was,
 	// but we don't compress on the outbound, we will run into issues. For example, if the compressed
 	// size is 450 bytes but uncompressed 1000 bytes now we are outside of the non-eDNS UDP size limits
-	response.Truncate(size(proxy.protocol, req))
-	_ = w.WriteMsg(response)
+	truncate(proxy.protocol, req, response)
+	_, _ = io.Copy(w, response)
 }
 
 // IsReady returns true if DNS lookup table is updated at least once.
@@ -355,7 +364,7 @@ func roundRobinResponse(res *dns.Msg) {
 		return
 	}
 
-	if res.Question[0].Qtype == dns.TypeAXFR || res.Question[0].Qtype == dns.TypeIXFR {
+	if qtype := dns.RRToType(res.Question[0]); qtype == dns.TypeAXFR || qtype == dns.TypeIXFR {
 		return
 	}
 
@@ -370,7 +379,7 @@ func roundRobin(in []dns.RR) []dns.RR {
 	mx := make([]dns.RR, 0)
 	rest := make([]dns.RR, 0)
 	for _, r := range in {
-		switch r.Header().Rrtype {
+		switch dns.RRToType(r) {
 		case dns.TypeCNAME:
 			cname = append(cname, r)
 		case dns.TypeA, dns.TypeAAAA:
@@ -396,13 +405,13 @@ func roundRobinShuffle[T any](entries []T) {
 	case 0, 1:
 		break
 	case 2:
-		if dns.Id()%2 == 0 {
+		if dns.ID()%2 == 0 {
 			entries[0], entries[1] = entries[1], entries[0]
 		}
 	default:
-		for j := 0; j < l*(int(dns.Id())%4+1); j++ {
-			q := int(dns.Id()) % l
-			p := int(dns.Id()) % l
+		for j := 0; j < l*(int(dns.ID())%4+1); j++ {
+			q := int(dns.ID()) % l
+			p := int(dns.ID()) % l
 			if q == p {
 				p = (p + 1) % l
 			}
@@ -417,16 +426,16 @@ func (h *LocalDNSServer) Close() {
 	}
 }
 
-func (h *LocalDNSServer) queryUpstream(upstreamClient *dns.Client, req *dns.Msg, scope *istiolog.Scope) *dns.Msg {
+func (h *LocalDNSServer) queryUpstream(ctx context.Context, upstreamClient *dns.Client, network string, req *dns.Msg, scope *istiolog.Scope) *dns.Msg {
 	if h.forwardToUpstreamParallel {
-		return h.queryUpstreamParallel(upstreamClient, req, scope)
+		return h.queryUpstreamParallel(ctx, upstreamClient, network, req, scope)
 	}
 
 	var response *dns.Msg
 	servers := slices.Clone(h.resolvConfServers)
 	roundRobinShuffle(servers)
 	for _, upstream := range servers {
-		cResponse, _, err := upstreamClient.Exchange(req, upstream)
+		cResponse, _, err := upstreamClient.Exchange(ctx, req, network, upstream)
 		if err == nil {
 			response = cResponse
 			break
@@ -450,17 +459,17 @@ func (h *LocalDNSServer) queryUpstream(upstreamClient *dns.Client, req *dns.Msg,
 //     response—or defer to the operating system, which we have no control over.
 //   - systemd-resolved: which is used as a default resolver in many Linux distributions nowadays also performs parallel
 //     lookups for multiple DNS servers and returns the first successful response.
-func (h *LocalDNSServer) queryUpstreamParallel(upstreamClient *dns.Client, req *dns.Msg, scope *istiolog.Scope) *dns.Msg {
+func (h *LocalDNSServer) queryUpstreamParallel(ctx context.Context, upstreamClient *dns.Client, network string, req *dns.Msg, scope *istiolog.Scope) *dns.Msg {
 	// Guarantee that the ctx we use below is done when this function returns.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	responseCh := make(chan *dns.Msg)
 	errCh := make(chan error)
 
 	queryOne := func(upstream string) {
-		// Note: After DialContext in ExchangeContext is called, this function cannot be cancelled by context.
-		cResponse, _, err := upstreamClient.ExchangeContext(ctx, req, upstream)
+		// Note: After DialContext in Exchange is called, this function cannot be cancelled by context.
+		cResponse, _, err := upstreamClient.Exchange(ctx, req, network, upstream)
 		if err == nil {
 			// Only reserve first response and ignore others.
 			select {
@@ -500,7 +509,7 @@ func (h *LocalDNSServer) queryUpstreamParallel(upstreamClient *dns.Client, req *
 func serverFailure(req *dns.Msg) *dns.Msg {
 	failures.Increment()
 	response := new(dns.Msg)
-	response.SetReply(req)
+	dnsutil.SetReply(response, req)
 	response.Rcode = dns.RcodeServerFailure
 	return response
 }
@@ -548,7 +557,7 @@ func (table *LookupTable) lookupHost(qtype uint16, hostname string) ([]dns.RR, b
 	// For example for "*.example.com", with the question "svc.svcns.example.com",
 	// we check if we have entries for "*.svcns.example.com", "*.example.com" etc.
 	if !hostFound {
-		labels := dns.SplitDomainName(hostname)
+		labels := dnsutil.Split(hostname)
 		for idx := range labels {
 			qhost := "*." + strings.Join(labels[idx+1:], ".") + "."
 			if hostFound = table.allHosts.Contains(qhost); hostFound {
@@ -573,7 +582,7 @@ func (table *LookupTable) lookupHost(qtype uint16, hostname string) ([]dns.RR, b
 	// So lookup the cname table first
 	for _, cn := range table.cname[hostname] {
 		// this was a cname match
-		copied := dns.Copy(cn).(*dns.CNAME)
+		copied := cn.Clone().(*dns.CNAME)
 		copied.Header().Name = question
 		cnAnswers = append(cnAnswers, copied)
 		hostname = copied.Target
@@ -593,7 +602,7 @@ func (table *LookupTable) lookupHost(qtype uint16, hostname string) ([]dns.RR, b
 		// For wildcard hosts, set the host that is being queried for.
 		if wildcard {
 			for _, answer := range ipAnswers {
-				copied := dns.Copy(answer)
+				copied := answer.Clone()
 				/// If there is a CNAME record for the wildcard host, we will sent a chained response of CNAME + A/AAAA pointer
 				/// Otherwise we expand the wildcard to the original question domain
 				if len(cnAnswers) > 0 {
@@ -674,8 +683,8 @@ func a(host string, ips []netip.Addr) []dns.RR {
 	answers := make([]dns.RR, len(ips))
 	for i, ip := range ips {
 		r := new(dns.A)
-		r.Hdr = dns.RR_Header{Name: host, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: defaultTTLInSeconds}
-		r.A = ip.AsSlice()
+		r.Hdr = dns.Header{Name: host, Class: dns.ClassINET, TTL: defaultTTLInSeconds}
+		r.A.Addr = ip
 		answers[i] = r
 	}
 	return answers
@@ -686,8 +695,8 @@ func aaaa(host string, ips []netip.Addr) []dns.RR {
 	answers := make([]dns.RR, len(ips))
 	for i, ip := range ips {
 		r := new(dns.AAAA)
-		r.Hdr = dns.RR_Header{Name: host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: defaultTTLInSeconds}
-		r.AAAA = ip.AsSlice()
+		r.Hdr = dns.Header{Name: host, Class: dns.ClassINET, TTL: defaultTTLInSeconds}
+		r.AAAA.Addr = ip
 		answers[i] = r
 	}
 	return answers
@@ -695,23 +704,60 @@ func aaaa(host string, ips []netip.Addr) []dns.RR {
 
 func cname(host string, targetHost string) []dns.RR {
 	answer := new(dns.CNAME)
-	answer.Hdr = dns.RR_Header{
-		Name:   host,
-		Rrtype: dns.TypeCNAME,
-		Class:  dns.ClassINET,
-		Ttl:    defaultTTLInSeconds,
+	answer.Hdr = dns.Header{
+		Name:  host,
+		Class: dns.ClassINET,
+		TTL:   defaultTTLInSeconds,
 	}
 	answer.Target = targetHost
 	return []dns.RR{answer}
 }
 
+// truncate ensures the response fits within the buffer size advertised by the
+// request (or the TCP maximum). It sets the response's advertised UDP size and,
+// if the packed message would still exceed it, drops trailing records (additional,
+// then authority, then answer) until it fits, setting the TC bit.
+//
+// v2 does not provide a size-aware truncation (dnsutil.Truncate strips *all*
+// records), so we reproduce the record-preserving behavior of the v1
+// (*Msg).Truncate helper here.
+func truncate(proto string, req, resp *dns.Msg) {
+	sz := size(proto, req)
+	// Only advertise an EDNS0 UDP size on the response when the request carried one.
+	if req.UDPSize > 0 {
+		resp.UDPSize = uint16(sz)
+	}
+	// packedLen returns the actual wire length of resp. We use the packed size (which
+	// accounts for name compression) rather than Msg.Len (an over-estimate that ignores
+	// compression), so we keep as many records as genuinely fit - matching v1's
+	// (*Msg).Truncate.
+	packedLen := func() int {
+		if err := resp.Pack(); err != nil {
+			log.Warnf("failed to pack DNS response for truncation, response will be truncated: %v", err)
+			return int(dns.MaxMsgSize) + 1
+		}
+		return len(resp.Data)
+	}
+	if packedLen() <= sz {
+		return
+	}
+	resp.Truncated = true
+	for packedLen() > sz && len(resp.Extra) > 0 {
+		resp.Extra = resp.Extra[:len(resp.Extra)-1]
+	}
+	for packedLen() > sz && len(resp.Ns) > 0 {
+		resp.Ns = resp.Ns[:len(resp.Ns)-1]
+	}
+	for packedLen() > sz && len(resp.Answer) > 0 {
+		resp.Answer = resp.Answer[:len(resp.Answer)-1]
+	}
+}
+
 // Size returns if buffer size *advertised* in the requests OPT record.
 // Or when the request was over TCP, we return the maximum allowed size of 64K.
 func size(proto string, r *dns.Msg) int {
-	size := uint16(0)
-	if o := r.IsEdns0(); o != nil {
-		size = o.UDPSize()
-	}
+	// In v2, the advertised EDNS0 UDP size is available directly on the message.
+	size := r.UDPSize
 
 	// normalize size
 	size = ednsSize(proto, size)

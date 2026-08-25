@@ -15,14 +15,18 @@
 package client
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"net"
 	"net/netip"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/miekg/dns"
+	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsutil"
 	"go.uber.org/atomic"
 
 	dnsProto "istio.io/istio/pkg/dns/proto"
@@ -39,6 +43,39 @@ func TestDNSForwardParallel(t *testing.T) {
 func TestDNS(t *testing.T) {
 	d := initDNS(t, false)
 	testDNS(t, d)
+}
+
+// TestDNSNoUnsolicitedOPT verifies that a query without EDNS gets a response without an OPT
+// record. RFC 6891 §6.1.1 forbids responding with an OPT when the query carried none. This is a
+// regression guard for the v2 migration: truncate() must not unconditionally set resp.UDPSize,
+// which would inject an OPT into every response - notably every TCP response, where the size
+// limit is MaxMsgSize (> MinMsgSize). In v2 a response OPT is unpacked into the Pseudo section.
+func TestDNSNoUnsolicitedOPT(t *testing.T) {
+	d := initDNS(t, false)
+	// dnsProxies[0] is the udp listener, dnsProxies[1] the tcp listener.
+	addrs := map[string]string{"udp": d.dnsProxies[0].Address(), "tcp": d.dnsProxies[1].Address()}
+	for _, network := range []string{"udp", "tcp"} {
+		t.Run(network, func(t *testing.T) {
+			c := dns.Client{Transport: &dns.Transport{
+				Dialer:       &net.Dialer{Timeout: 3 * time.Second},
+				ReadTimeout:  3 * time.Second,
+				WriteTimeout: 3 * time.Second,
+			}}
+			m := new(dns.Msg)
+			// Note: no UDPSize/EDNS set on the request.
+			dnsutil.SetQuestion(m, "productpage.ns1.svc.cluster.local.", dns.TypeA)
+			res, _, err := c.Exchange(context.Background(), m, network, addrs[network])
+			if err != nil {
+				t.Fatalf("failed to resolve: %v", err)
+			}
+			if len(res.Pseudo) != 0 {
+				t.Errorf("expected no OPT/pseudo records in response to non-EDNS %s query, got %v", network, res.Pseudo)
+			}
+			if res.UDPSize != 0 {
+				t.Errorf("expected response UDPSize 0 for non-EDNS %s query, got %d", network, res.UDPSize)
+			}
+		})
+	}
 }
 
 func TestBuildAlternateHosts(t *testing.T) {
@@ -132,7 +169,7 @@ func testDNS(t *testing.T, d *LocalDNSServer) {
 		id                       int
 		queryAAAA                bool
 		expected                 []dns.RR
-		expectResolutionFailure  int
+		expectResolutionFailure  uint16
 		expectExternalResolution bool
 		modifyReq                func(msg *dns.Msg)
 	}{
@@ -327,7 +364,7 @@ func testDNS(t *testing.T, d *LocalDNSServer) {
 			expectResolutionFailure: dns.RcodeSuccess,
 			expected:                giantResponse,
 			modifyReq: func(msg *dns.Msg) {
-				msg.SetEdns0(dns.MaxMsgSize, false)
+				msg.UDPSize, msg.Security = dns.MaxMsgSize, false
 			},
 		},
 		{
@@ -343,41 +380,43 @@ func testDNS(t *testing.T, d *LocalDNSServer) {
 		},
 	}
 
-	clients := []dns.Client{
-		{
-			Timeout: 3 * time.Second,
-			Net:     "udp",
-			UDPSize: 65535,
-		},
-		{
-			Timeout: 3 * time.Second,
-			Net:     "tcp",
-		},
+	// In v2 the network is passed per-Exchange and the advertised UDP buffer size is set on
+	// the request message rather than the client. Timeouts live on the Transport. Note: setting
+	// m.UDPSize both advertises EDNS on the request and sizes the read buffer, so we leave it
+	// unset by default and let individual test cases opt in via modifyReq (see the edns case).
+	newClient := func() dns.Client {
+		return dns.Client{Transport: &dns.Transport{
+			Dialer:       &net.Dialer{Timeout: 3 * time.Second},
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+		}}
 	}
+	clients := []dns.Client{newClient(), newClient()}
+	networks := []string{"udp", "tcp"}
 	addresses := []string{
 		d.dnsProxies[0].Address(),
 		d.dnsProxies[1].Address(),
 	}
 	currentID := atomic.NewInt32(0)
-	oldID := dns.Id
-	dns.Id = func() uint16 {
+	oldID := dns.ID
+	dns.ID = func() uint16 {
 		return uint16(currentID.Inc())
 	}
-	defer func() { dns.Id = oldID }()
+	defer func() { dns.ID = oldID }()
 	for i := range clients {
 		addr := addresses[i]
 		for _, tt := range testCases {
 			// Test is for explicit network
-			if (strings.HasPrefix(tt.name, "udp") || strings.HasPrefix(tt.name, "tcp")) && !strings.HasPrefix(tt.name, clients[i].Net) {
+			if (strings.HasPrefix(tt.name, "udp") || strings.HasPrefix(tt.name, "tcp")) && !strings.HasPrefix(tt.name, networks[i]) {
 				continue
 			}
-			t.Run(clients[i].Net+"-"+tt.name, func(t *testing.T) {
+			t.Run(networks[i]+"-"+tt.name, func(t *testing.T) {
 				m := new(dns.Msg)
 				q := dns.TypeA
 				if tt.queryAAAA {
 					q = dns.TypeAAAA
 				}
-				m.SetQuestion(tt.host, q)
+				dnsutil.SetQuestion(m, tt.host, q)
 				if tt.modifyReq != nil {
 					tt.modifyReq(m)
 				}
@@ -385,7 +424,7 @@ func testDNS(t *testing.T, d *LocalDNSServer) {
 					currentID.Store(int32(tt.id))
 					defer func() { currentID.Store(0) }()
 				}
-				res, _, err := clients[i].Exchange(m, addr)
+				res, _, err := clients[i].Exchange(context.Background(), m, networks[i], addr)
 				if res != nil {
 					t.Log("size: ", len(res.Answer))
 				}
@@ -447,15 +486,16 @@ func bench(t *testing.B, nameserver string, hostname string) {
 	nrs := 0
 	nxdomain := 0
 	cnames := 0
-	c := dns.Client{
-		Timeout: 1 * time.Second,
-	}
+	c := dns.Client{Transport: &dns.Transport{
+		Dialer:      &net.Dialer{Timeout: 1 * time.Second},
+		ReadTimeout: 1 * time.Second,
+	}}
 	for i := 0; i < t.N; i++ {
 		toResolve := hostname
 	redirect:
 		m := new(dns.Msg)
-		m.SetQuestion(toResolve, dns.TypeA)
-		res, _, err := c.Exchange(m, nameserver)
+		dnsutil.SetQuestion(m, toResolve, dns.TypeA)
+		res, _, err := c.Exchange(context.Background(), m, "udp", nameserver)
 
 		if err != nil {
 			errs++
@@ -463,7 +503,7 @@ func bench(t *testing.B, nameserver string, hostname string) {
 			nrs++
 		} else {
 			for _, a := range res.Answer {
-				if arec, ok := a.(*dns.A); !ok {
+				if _, ok := a.(*dns.A); !ok {
 					// check if this is a cname redirect. If so, repeat the resolution
 					// assuming the client does not see/respect the inlined A record in the response.
 					if crec, ok := a.(*dns.CNAME); !ok {
@@ -474,7 +514,7 @@ func bench(t *testing.B, nameserver string, hostname string) {
 						goto redirect
 					}
 				} else {
-					if arec.Hdr.Rrtype != dns.RcodeSuccess {
+					if res.Rcode != dns.RcodeSuccess {
 						nxdomain++
 					}
 				}
@@ -496,45 +536,30 @@ var giantResponse = func() []dns.RR {
 }()
 
 func makeUpstream(t test.Failer, responses map[string]string) string {
-	mux := dns.NewServeMux()
-	mux.HandleFunc(".", func(resp dns.ResponseWriter, msg *dns.Msg) {
+	// v2's dns.ServeMux no longer treats "." as a catch-all, and dnsutil.SetReply resets
+	// the answer sections, so use a single handler that dispatches by question name and
+	// only populates the answer after SetReply.
+	handler := dns.HandlerFunc(func(_ context.Context, resp dns.ResponseWriter, msg *dns.Msg) {
 		answer := new(dns.Msg)
-		answer.SetReply(msg)
-		answer.Rcode = dns.RcodeNameError
-		if err := resp.WriteMsg(answer); err != nil {
-			t.Fatalf("err: %s", err)
-		}
-	})
-	for hn, desiredResp := range responses {
-		mux.HandleFunc(hn, func(resp dns.ResponseWriter, msg *dns.Msg) {
-			answer := dns.Msg{
-				Answer: a(hn, []netip.Addr{netip.MustParseAddr(desiredResp)}),
-			}
-			answer.SetReply(msg)
+		dnsutil.SetReply(answer, msg)
+		name := msg.Question[0].Header().Name
+		switch {
+		case name == "giant.":
 			answer.Rcode = dns.RcodeSuccess
-			if err := resp.WriteMsg(&answer); err != nil {
-				t.Fatalf("err: %s", err)
+			answer.Answer = giantResponse
+		case name == "giant-tc.":
+			answer.Rcode = dns.RcodeSuccess
+			answer.Answer = giantResponse
+			truncate("udp", msg, answer)
+		default:
+			if desiredResp, ok := responses[name]; ok {
+				answer.Rcode = dns.RcodeSuccess
+				answer.Answer = a(name, []netip.Addr{netip.MustParseAddr(desiredResp)})
+			} else {
+				answer.Rcode = dns.RcodeNameError
 			}
-		})
-	}
-	mux.HandleFunc("giant.", func(resp dns.ResponseWriter, msg *dns.Msg) {
-		answer := &dns.Msg{
-			Answer: giantResponse,
 		}
-		answer.SetReply(msg)
-		answer.Rcode = dns.RcodeSuccess
-		if err := resp.WriteMsg(answer); err != nil {
-			t.Fatalf("err: %s", err)
-		}
-	})
-	mux.HandleFunc("giant-tc.", func(resp dns.ResponseWriter, msg *dns.Msg) {
-		answer := &dns.Msg{
-			Answer: giantResponse,
-		}
-		answer.SetReply(msg)
-		answer.Rcode = dns.RcodeSuccess
-		answer.Truncate(size("udp", msg))
-		if err := resp.WriteMsg(answer); err != nil {
+		if _, err := io.Copy(resp, answer); err != nil {
 			t.Fatalf("err: %s", err)
 		}
 	})
@@ -543,8 +568,8 @@ func makeUpstream(t test.Failer, responses map[string]string) string {
 	tcp := &dns.Server{
 		Addr:              "127.0.0.1:0",
 		Net:               "tcp",
-		Handler:           mux,
-		NotifyStartedFunc: func() { close(up) },
+		Handler:           handler,
+		NotifyStartedFunc: func(context.Context) { close(up) },
 	}
 	go func() {
 		if err := tcp.ListenAndServe(); err != nil {
@@ -562,10 +587,9 @@ func makeUpstream(t test.Failer, responses map[string]string) string {
 	server := &dns.Server{
 		Addr:              tcp.Listener.Addr().String(),
 		Net:               "udp",
-		Handler:           mux,
-		NotifyStartedFunc: func() { close(up) },
+		Handler:           handler,
+		NotifyStartedFunc: func(context.Context) { close(up) },
 		ReadTimeout:       time.Second,
-		WriteTimeout:      time.Second,
 	}
 	go func() {
 		if err := server.ListenAndServe(); err != nil {
@@ -577,7 +601,6 @@ func makeUpstream(t test.Failer, responses map[string]string) string {
 		t.Fatal("setup timeout")
 	case <-up:
 	}
-	t.Cleanup(func() { _ = server.Shutdown() })
 	server.Addr = server.PacketConn.LocalAddr().String()
 
 	select {
@@ -585,8 +608,8 @@ func makeUpstream(t test.Failer, responses map[string]string) string {
 		t.Fatal("setup timeout")
 	case <-up:
 	}
-	t.Cleanup(func() { _ = tcp.Shutdown() })
-	t.Cleanup(func() { _ = server.Shutdown() })
+	t.Cleanup(func() { tcp.Shutdown(context.Background()) })
+	t.Cleanup(func() { server.Shutdown(context.Background()) })
 	tcp.Addr = server.PacketConn.LocalAddr().String()
 	return server.Addr
 }
@@ -671,13 +694,8 @@ func fillTable(server *LocalDNSServer) {
 	})
 }
 
-// reflect.DeepEqual doesn't seem to work well for dns.RR
-// as the Rdlength field is not updated in the a(), or aaaa() calls.
-// so zero them out before doing reflect.Deepequal
+// In v2 the RR header no longer carries an Rdlength field, so DeepEqual works directly.
 func equalsDNSrecords(got []dns.RR, want []dns.RR) bool {
-	for i := range got {
-		got[i].Header().Rdlength = 0
-	}
 	return reflect.DeepEqual(got, want)
 }
 
@@ -705,7 +723,7 @@ func TestDNSTimeoutBehavior(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create an upstream DNS server that never responds (to trigger timeout)
-			unresponsiveHandler := func(w dns.ResponseWriter, req *dns.Msg) {
+			unresponsiveHandler := func(_ context.Context, w dns.ResponseWriter, req *dns.Msg) {
 				// Don't respond - just return without writing anything
 				// This will cause the client to timeout
 			}
@@ -715,14 +733,14 @@ func TestDNSTimeoutBehavior(t *testing.T) {
 				Addr:              "127.0.0.1:0",
 				Net:               "udp",
 				Handler:           dns.HandlerFunc(unresponsiveHandler),
-				NotifyStartedFunc: func() { close(up) },
+				NotifyStartedFunc: func(context.Context) { close(up) },
 			}
 
 			go func() {
 				_ = server.ListenAndServe()
 			}()
 			defer func() {
-				_ = server.Shutdown()
+				server.Shutdown(context.Background())
 			}()
 
 			// Wait for server to be ready
@@ -744,10 +762,10 @@ func TestDNSTimeoutBehavior(t *testing.T) {
 
 			// Make a query and measure how long it takes
 			req := new(dns.Msg)
-			req.SetQuestion("test.example.com.", dns.TypeA)
+			dnsutil.SetQuestion(req, "test.example.com.", dns.TypeA)
 
 			start := time.Now()
-			response := dnsServer.queryUpstream(dnsServer.dnsProxies[0].upstreamClient, req, log)
+			response := dnsServer.queryUpstream(context.Background(), dnsServer.dnsProxies[0].upstreamClient, "udp", req, log)
 			duration := time.Since(start)
 
 			// Should get SERVFAIL due to timeout

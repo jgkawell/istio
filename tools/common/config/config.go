@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/miekg/dns"
+	"codeberg.org/miekg/dns/dnsconf"
 
 	"istio.io/istio/pkg/env"
 	"istio.io/istio/pkg/log"
@@ -201,7 +201,7 @@ func (c *Config) FillConfigFromEnvironment() error {
 	// If capture all DNS option is enabled, we don't need to read from the dns resolve conf. All
 	// traffic to port 53 will be captured.
 	if c.RedirectDNS && !c.CaptureAllDNS {
-		dnsConfig, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+		dnsConfig, err := dnsconf.FromFile("/etc/resolv.conf")
 		if err != nil {
 			return fmt.Errorf("failed to load /etc/resolv.conf: %v", err)
 		}

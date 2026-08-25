@@ -15,40 +15,55 @@
 package client
 
 import (
+	"context"
 	"net"
+	"sync/atomic"
 	"time"
 
-	"github.com/miekg/dns"
+	"codeberg.org/miekg/dns"
 )
 
 type dnsProxy struct {
-	serveMux *dns.ServeMux
-	server   *dns.Server
+	server *dns.Server
 
 	// This is the upstream Client used to make upstream DNS queries
 	// in case the data is not in our name table.
 	upstreamClient *dns.Client
 	protocol       string
 	resolver       *LocalDNSServer
+	// started tracks whether the server is actually listening (set from NotifyStartedFunc).
+	// In v2, dns.Server.Shutdown dereferences state set up by ListenAndServe and panics if
+	// the server was never started, so close() must only shut down a started server.
+	started atomic.Bool
 }
 
 func newDNSProxy(protocol, addr string, resolver *LocalDNSServer, timeout time.Duration) (*dnsProxy, error) {
 	p := &dnsProxy{
-		serveMux: dns.NewServeMux(),
-		server:   &dns.Server{},
+		server: &dns.Server{},
+		// The network (udp/tcp) is passed per-Exchange in v2; timeouts live on the Transport.
 		upstreamClient: &dns.Client{
-			Net:          protocol,
-			DialTimeout:  timeout,
-			ReadTimeout:  timeout,
-			WriteTimeout: timeout,
+			Transport: &dns.Transport{
+				Dialer:       &net.Dialer{Timeout: timeout},
+				ReadTimeout:  timeout,
+				WriteTimeout: timeout,
+			},
 		},
 		protocol: protocol,
 		resolver: resolver,
 	}
 
 	var err error
-	p.serveMux.Handle(".", p)
-	p.server.Handler = p.serveMux
+	// dnsProxy is itself the DNS handler for every query. v2's dns.ServeMux no longer
+	// treats "." as a catch-all for arbitrary names, so set the Handler directly instead
+	// of routing through a ServeMux.
+	p.server.Handler = p
+	// Mark the server started only once it is actually listening. ListenAndServe sets up
+	// the state Shutdown dereferences (cancel func, shutdown/exited channels) inside its
+	// init(); flipping the flag here (rather than at the top of start()) closes the window
+	// where close() could call Shutdown before that state exists and panic.
+	p.server.NotifyStartedFunc = func(context.Context) {
+		p.started.Store(true)
+	}
 	if protocol == "udp" {
 		p.server.PacketConn, err = net.ListenPacket("udp", addr)
 	} else {
@@ -63,17 +78,15 @@ func newDNSProxy(protocol, addr string, resolver *LocalDNSServer, timeout time.D
 }
 
 func (p *dnsProxy) start() {
-	err := p.server.ActivateAndServe()
+	err := p.server.ListenAndServe()
 	if err != nil {
 		log.Errorf("Local %s DNS server terminated: %v", p.protocol, err)
 	}
 }
 
 func (p *dnsProxy) close() {
-	if p.server != nil {
-		if err := p.server.Shutdown(); err != nil {
-			log.Errorf("error in shutting down %s dns downstreamUDPServer :%v", p.protocol, err)
-		}
+	if p.server != nil && p.started.Load() {
+		p.server.Shutdown(context.Background())
 	}
 }
 
@@ -89,6 +102,6 @@ func (p *dnsProxy) Address() string {
 	return ""
 }
 
-func (p *dnsProxy) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
-	p.resolver.ServeDNS(p, w, req)
+func (p *dnsProxy) ServeDNS(ctx context.Context, w dns.ResponseWriter, req *dns.Msg) {
+	p.resolver.ServeDNS(ctx, p, w, req)
 }

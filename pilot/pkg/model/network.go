@@ -16,14 +16,17 @@ package model
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"net"
 	"sort"
 	"sync"
 	"time"
 
+	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsconf"
+	"codeberg.org/miekg/dns/dnsutil"
 	"github.com/hashicorp/go-multierror"
-	"github.com/miekg/dns"
 	"k8s.io/apimachinery/pkg/types"
 
 	"istio.io/istio/pilot/pkg/features"
@@ -479,7 +482,7 @@ func (n *networkGatewayNameCache) resolve(name string) ([]string, time.Duration,
 	doResolve := func(dnsType uint16) {
 		defer wg.Done()
 
-		res := n.client.Query(new(dns.Msg).SetQuestion(dns.Fqdn(name), dnsType))
+		res := n.client.Query(dnsutil.SetQuestion(new(dns.Msg), dnsutil.Fqdn(name), dnsType))
 
 		mu.Lock()
 		defer mu.Unlock()
@@ -515,31 +518,30 @@ func (n *networkGatewayNameCache) resolve(name string) ([]string, time.Duration,
 
 // https://github.com/coredns/coredns/blob/v1.10.1/plugin/pkg/dnsutil/ttl.go
 func minimalTTL(m *dns.Msg) time.Duration {
-	// No records or OPT is the only record, return a short ttl as a fail safe.
-	if len(m.Answer)+len(m.Ns) == 0 &&
-		(len(m.Extra) == 0 || (len(m.Extra) == 1 && m.Extra[0].Header().Rrtype == dns.TypeOPT)) {
+	// No records, return a short ttl as a fail safe. In v2 the OPT record is unpacked into
+	// the Pseudo section rather than Extra, so an EDNS-only response has an empty Extra and
+	// no longer needs a special case here.
+	if len(m.Answer)+len(m.Ns)+len(m.Extra) == 0 {
 		return MinGatewayTTL
 	}
 
 	minTTL := MaxGatewayTTL
 	for _, r := range m.Answer {
-		if r.Header().Ttl < uint32(minTTL.Seconds()) {
-			minTTL = time.Duration(r.Header().Ttl) * time.Second
+		if r.Header().TTL < uint32(minTTL.Seconds()) {
+			minTTL = time.Duration(r.Header().TTL) * time.Second
 		}
 	}
 	for _, r := range m.Ns {
-		if r.Header().Ttl < uint32(minTTL.Seconds()) {
-			minTTL = time.Duration(r.Header().Ttl) * time.Second
+		if r.Header().TTL < uint32(minTTL.Seconds()) {
+			minTTL = time.Duration(r.Header().TTL) * time.Second
 		}
 	}
 
+	// OPT lives in m.Pseudo in v2 (its TTL field carries extended rcode/flags, not a real
+	// TTL), so it is correctly excluded from this loop over m.Extra.
 	for _, r := range m.Extra {
-		if r.Header().Rrtype == dns.TypeOPT {
-			// OPT records use TTL field for extended rcode and flags
-			continue
-		}
-		if r.Header().Ttl < uint32(minTTL.Seconds()) {
-			minTTL = time.Duration(r.Header().Ttl) * time.Second
+		if r.Header().TTL < uint32(minTTL.Seconds()) {
+			minTTL = time.Duration(r.Header().TTL) * time.Second
 		}
 	}
 	return minTTL
@@ -557,7 +559,7 @@ var NetworkGatewayTestDNSServers []string
 func newClient() (*dnsClient, error) {
 	servers := NetworkGatewayTestDNSServers
 	if len(servers) == 0 {
-		dnsConfig, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+		dnsConfig, err := dnsconf.FromFile("/etc/resolv.conf")
 		if err != nil {
 			return nil, err
 		}
@@ -572,9 +574,11 @@ func newClient() (*dnsClient, error) {
 
 	c := &dnsClient{
 		Client: &dns.Client{
-			DialTimeout:  5 * time.Second,
-			ReadTimeout:  5 * time.Second,
-			WriteTimeout: 5 * time.Second,
+			Transport: &dns.Transport{
+				Dialer:       &net.Dialer{Timeout: 5 * time.Second},
+				ReadTimeout:  5 * time.Second,
+				WriteTimeout: 5 * time.Second,
+			},
 		},
 	}
 	c.resolvConfServers = append(c.resolvConfServers, servers...)
@@ -585,7 +589,7 @@ func newClient() (*dnsClient, error) {
 func getReqNames(req *dns.Msg) []string {
 	names := make([]string, 0, 1)
 	for _, qq := range req.Question {
-		names = append(names, qq.Name)
+		names = append(names, qq.Header().Name)
 	}
 	return names
 }
@@ -593,8 +597,8 @@ func getReqNames(req *dns.Msg) []string {
 func (c *dnsClient) Query(req *dns.Msg) *dns.Msg {
 	var response *dns.Msg
 	for _, upstream := range c.resolvConfServers {
-		cResponse, _, err := c.Exchange(req, upstream)
-		rcode := dns.RcodeServerFailure
+		cResponse, _, err := c.Exchange(context.Background(), req, "udp", upstream)
+		rcode := uint16(dns.RcodeServerFailure)
 		if err == nil && cResponse != nil {
 			rcode = cResponse.Rcode
 		}
@@ -613,7 +617,7 @@ func (c *dnsClient) Query(req *dns.Msg) *dns.Msg {
 	}
 	if response == nil {
 		response = new(dns.Msg)
-		response.SetReply(req)
+		dnsutil.SetReply(response, req)
 		response.Rcode = dns.RcodeServerFailure
 	}
 	return response

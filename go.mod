@@ -1,9 +1,10 @@
 module istio.io/istio
 
-go 1.26.0
+go 1.27.0
 
 require (
 	cloud.google.com/go/compute/metadata v0.9.0
+	codeberg.org/miekg/dns v0.6.103
 	github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6
 	github.com/KimMachineGun/automemlimit v0.7.5
 	github.com/Masterminds/semver/v3 v3.5.0
@@ -47,7 +48,6 @@ require (
 	github.com/klauspost/compress v1.18.6
 	github.com/lestrrat-go/jwx v1.2.31
 	github.com/mattn/go-isatty v0.0.22
-	github.com/miekg/dns v1.1.72
 	github.com/mitchellh/copystructure v1.2.0
 	github.com/moby/buildkit v0.30.0
 	github.com/onsi/gomega v1.41.0
@@ -181,6 +181,7 @@ require (
 	github.com/liggitt/tabwriter v0.0.0-20181228230101-89fcab3d43de // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-runewidth v0.0.17 // indirect
+	github.com/miekg/dns v1.1.72 // indirect
 	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/moby/spdystream v0.5.1 // indirect

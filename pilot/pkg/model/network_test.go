@@ -15,14 +15,18 @@
 package model_test
 
 import (
+	"context"
 	"fmt"
-	"net"
+	"io"
+	"net/netip"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/miekg/dns"
+	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsutil"
+	"codeberg.org/miekg/dns/rdata"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/model"
@@ -50,11 +54,8 @@ func TestGatewayHostnames(t *testing.T) {
 		workingDNSServer.Server.PacketConn.LocalAddr().String(),
 	}
 	t.Cleanup(func() {
-		errW := workingDNSServer.Shutdown()
-		errF := failingDNSServer.Shutdown()
-		if errW != nil || errF != nil {
-			t.Logf("failed shutting down fake dns servers")
-		}
+		workingDNSServer.Shutdown(context.Background())
+		failingDNSServer.Shutdown(context.Background())
 	})
 
 	meshNetworks := meshwatcher.NewFixedNetworksWatcher(nil)
@@ -158,14 +159,14 @@ func newFakeDNSServer(ttl uint32, hosts sets.String) *fakeDNSServer {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	s := &fakeDNSServer{
-		Server: &dns.Server{Addr: ":0", Net: "udp", NotifyStartedFunc: wg.Done},
+		Server: &dns.Server{Addr: ":0", Net: "udp", NotifyStartedFunc: func(context.Context) { wg.Done() }},
 		ttl:    ttl,
 		hosts:  make(map[string]int, len(hosts)),
 	}
 	s.Handler = s
 
 	for k := range hosts {
-		s.hosts[dns.Fqdn(k)] = 0
+		s.hosts[dnsutil.Fqdn(k)] = 0
 	}
 
 	go func() {
@@ -177,29 +178,29 @@ func newFakeDNSServer(ttl uint32, hosts sets.String) *fakeDNSServer {
 	return s
 }
 
-func (s *fakeDNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
+func (s *fakeDNSServer) ServeDNS(_ context.Context, w dns.ResponseWriter, r *dns.Msg) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	msg := (&dns.Msg{}).SetReply(r)
+	msg := dnsutil.SetReply(&dns.Msg{}, r)
 	if s.failure {
 		msg.Rcode = dns.RcodeServerFailure
 	} else {
-		domain := msg.Question[0].Name
+		domain := msg.Question[0].Header().Name
 		c, ok := s.hosts[domain]
 		if ok {
 			s.hosts[domain]++
-			switch r.Question[0].Qtype {
+			switch dns.RRToType(r.Question[0]) {
 			case dns.TypeA:
 				msg.Answer = append(msg.Answer, &dns.A{
-					Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: s.ttl},
-					A:   net.ParseIP(fmt.Sprintf("10.0.0.%d", c)),
+					Hdr: dns.Header{Name: domain, Class: dns.ClassINET, TTL: s.ttl},
+					A:   rdata.A{Addr: netip.MustParseAddr(fmt.Sprintf("10.0.0.%d", c))},
 				})
 			case dns.TypeAAAA:
 				// set a long TTL for AAAA
 				msg.Answer = append(msg.Answer, &dns.AAAA{
-					Hdr:  dns.RR_Header{Name: domain, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: s.ttl * 10},
-					AAAA: net.ParseIP(fmt.Sprintf("fd00::%x", c)),
+					Hdr:  dns.Header{Name: domain, Class: dns.ClassINET, TTL: s.ttl * 10},
+					AAAA: rdata.AAAA{Addr: netip.MustParseAddr(fmt.Sprintf("fd00::%x", c))},
 				})
 			// simulate behavior of some public/cloud DNS like Cloudflare or DigitalOcean
 			case dns.TypeANY:
@@ -211,7 +212,7 @@ func (s *fakeDNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 			msg.Rcode = dns.RcodeNameError
 		}
 	}
-	if err := w.WriteMsg(msg); err != nil {
+	if _, err := io.Copy(w, msg); err != nil {
 		scopes.Framework.Errorf("failed writing fake DNS response: %v", err)
 	}
 }
@@ -221,7 +222,7 @@ func (s *fakeDNSServer) setHosts(hosts sets.String) {
 	defer s.mu.Unlock()
 	s.hosts = make(map[string]int, len(hosts))
 	for k := range hosts {
-		s.hosts[dns.Fqdn(k)] = 0
+		s.hosts[dnsutil.Fqdn(k)] = 0
 	}
 }
 
